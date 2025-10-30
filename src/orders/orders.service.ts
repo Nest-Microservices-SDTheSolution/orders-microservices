@@ -9,9 +9,10 @@ import { CreateOrderDto } from './dto/create-order.dto';
 import { PrismaClient } from 'generated/prisma';
 import { ClientProxy, RpcException } from '@nestjs/microservices';
 import { OrderPaginationDto } from './dto/order-paginatio.dto';
-import { ChangeOrderStatusDto } from './dto';
-import { NATS_SERVICE, PRODUCT_SERVICE } from 'src/config';
+import { ChangeOrderStatusDto, PaidOrderDto } from './dto';
+import { NATS_SERVICE } from 'src/config';
 import { firstValueFrom } from 'rxjs';
+import { OrderWithProducts } from './interfaces/order-with-products.interface';
 
 @Injectable()
 export class OrdersService extends PrismaClient implements OnModuleInit {
@@ -49,7 +50,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
         data: {
           totalAmount,
           totalItems,
-          OrderItems: {
+          OrderItem: {
             createMany: {
               data: createOrderDto.items.map((orderItem) => ({
                 price: products.find(
@@ -62,7 +63,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
           },
         },
         include: {
-          OrderItems: {
+          OrderItem: {
             select: {
               productId: true,
               quantity: true,
@@ -74,7 +75,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
 
       return {
         ...order,
-        OrderItem: order.OrderItems.map((orderItem) => ({
+        OrderItem: order.OrderItem.map((orderItem) => ({
           ...orderItem,
           name: products.find((product) => product.id === orderItem.productId)
             .name,
@@ -118,7 +119,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
     const order = await this.order.findFirst({
       where: { id },
       include: {
-        OrderItems: {
+        OrderItem: {
           select: { productId: true, quantity: true, price: true },
         },
       },
@@ -131,14 +132,14 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
       });
     }
 
-    const productIds = order.OrderItems.map((item) => item.productId);
+    const productIds = order.OrderItem.map((item) => item.productId);
     const products = await firstValueFrom(
       this.client.send({ cmd: 'validate_products' }, productIds),
     );
 
     return {
       ...order,
-      OrderItems: order.OrderItems.map((orderItem) => ({
+      OrderItem: order.OrderItem.map((orderItem) => ({
         ...orderItem,
         name: products.find((product) => product.id === orderItem.productId)
           .name,
@@ -158,5 +159,41 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
       where: { id },
       data: { status },
     });
+  }
+
+  async createPaymentSession(order: OrderWithProducts) {
+    const paymentSession = await firstValueFrom(
+      this.client.send('create.payment.session', {
+        orderId: order.id,
+        currency: 'usd',
+        items: order.OrderItem.map((item) => ({
+          name: item.name,
+          quantity: item.quantity,
+          price: item.price,
+        })),
+      }),
+    );
+    return paymentSession;
+  }
+
+  async paidOrder(paidOrderDto: PaidOrderDto) {
+    this.logger.log(`Processing paid order: ${JSON.stringify(paidOrderDto)}`);
+    const updatedOrder = await this.order.update({
+      where: { id: paidOrderDto.orderId },
+      data: {
+        status: 'PAID',
+        paid: true,
+        paidAt: new Date(),
+        stripeChargeId: paidOrderDto.stripePaymentId,
+        //la relacion
+        OrderReceipt: {
+          create: {
+            receiptUrl: paidOrderDto.receiptUrl,
+          },
+        },
+      },
+    });
+
+    return updatedOrder;
   }
 }
